@@ -13,6 +13,11 @@ import logging
 from loguru import logger
 from prettytable import PrettyTable
 from retrying import retry
+import numpy as np
+import cv2
+import tensorflow as tf
+from PIL import Image
+import os
 
 # 配置日志
 logging.basicConfig(
@@ -173,7 +178,7 @@ class CrawlBase:
 
     def do_request(self, url: str, method: Literal['GET', 'POST', 'get', 'post'], headers=None, params=None, data=None,
                    cookies=None, proxys=None, session: bool = False, middleware=None, is_abandon: bool = False) -> \
-    Union[requests.Response, RequestObj, None]:
+            Union[requests.Response, RequestObj, None]:
         if proxys is None:
             proxys = {}
         if cookies is None:
@@ -941,6 +946,359 @@ def demo_high_concurrency_crawler():
     for id_card in id_cards:
         info = crawler.parse_id_card_info(id_card)
         print(f"身份证信息: {info}")
+
+
+class GeetestCaptchaCracker:
+    """验证码破解类，借鉴crack_geetest-master项目的验证码破解逻辑"""
+
+    def __init__(self, mainimg_checkpoint_path=None, verimg_checkpoint_path=None, output_dir='./output/'):
+        """
+        初始化验证码破解器
+
+        Args:
+            mainimg_checkpoint_path: 主图片模型路径
+            verimg_checkpoint_path: 验证码图片模型路径
+            output_dir: 输出目录
+        """
+        self.mainimg_checkpoint_path = mainimg_checkpoint_path or './output/chinese/mainimg/'
+        self.verimg_checkpoint_path = verimg_checkpoint_path or './output/chinese/verimg/'
+        self.output_dir = output_dir
+
+        # 创建输出目录
+        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'main_img'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'verificate_img'), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, 'chinese'), exist_ok=True)
+
+        # 初始化模型
+        self._initialize_models()
+
+    def _load_label_dict(self):
+        """加载标签字典"""
+        label_dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       'GeetChinese_crack-master', 'data', 'label_dict.txt')
+
+        if not os.path.exists(label_dict_path):
+            # 如果标签字典不存在，创建一个默认的
+            label_dict = {
+                "0": "一", "1": "二", "2": "三", "3": "四", "4": "五",
+                "5": "六", "6": "七", "7": "八", "8": "九", "9": "十",
+                "10": "百", "11": "千", "12": "万", "13": "亿", "14": "零"
+            }
+            # 保存标签字典
+            os.makedirs(os.path.dirname(label_dict_path), exist_ok=True)
+            with open(label_dict_path, 'w', encoding='utf-8') as f:
+                for k, v in label_dict.items():
+                    f.write(f"{k}:{v}\n")
+        else:
+            # 加载标签字典
+            label_dict = {}
+            with open(label_dict_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if ':' in line:
+                        k, v = line.strip().split(':', 1)
+                        label_dict[k] = v
+
+        return label_dict
+
+    def _initialize_models(self):
+        """初始化模型"""
+        try:
+            # 导入边界框检测模块
+            sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeetChinese_crack-master'))
+            import Chinese_bboxdetect as bboxdetect
+            import Chinese_OCR_new as orc
+
+            # 加载Faster R-CNN网络
+            self.bboxdetect_sess, self.bboxdetect_net = bboxdetect.load_faster_rcnn_network()
+
+            # 加载OCR网络
+            self.mainimg_graph = tf.Graph()
+            self.mainimg_sess, self.mainimg_net = orc.load_chinese_orc_net(
+                self.mainimg_graph, self.mainimg_checkpoint_path)
+
+            self.verimg_graph = tf.Graph()
+            self.verimg_sess, self.verimg_net = orc.load_chinese_orc_net(
+                self.verimg_graph, self.verimg_checkpoint_path)
+
+            # 加载标签字典
+            self.label_dict = self._load_label_dict()
+
+            log.info("验证码破解模型初始化成功")
+        except Exception as e:
+            log.error(f"验证码破解模型初始化失败: {e}")
+            raise
+
+    def _find_image_bbox(self, img):
+        """查找图像边界框"""
+        v_sum = np.sum(img, axis=0)
+        start_i = None
+        end_i = None
+        minimun_range = 10
+        maximun_range = 20
+        min_val = 10
+        peek_ranges = []
+        ser_val = 0
+
+        # 从左往右扫描，遇到非零像素点就以此为字体的左边界
+        for i, val in enumerate(v_sum):
+            # 定位第一个字体的起始位置
+            if val > min_val and start_i is None:
+                start_i = i
+                ser_val = 0
+            # 继续扫描到字体，继续往右扫描
+            elif val > min_val and start_i is not None:
+                ser_val = 0
+            # 扫描到背景，判断空白长度
+            elif val <= min_val and start_i is not None:
+                ser_val = ser_val + 1
+                if (i - start_i >= minimun_range and ser_val > 2) or (i - start_i >= maximun_range):
+                    end_i = i
+                    if start_i > 5:
+                        start_i = start_i - 5
+                    peek_ranges.append((start_i, end_i + 2))
+                    start_i = None
+                    end_i = None
+            # 扫描到背景，继续扫描下一个字体
+            elif val <= min_val and start_i is None:
+                ser_val = ser_val + 1
+            else:
+                raise ValueError("cannot parse this case...")
+
+        return peek_ranges
+
+    def _cut_geetcode(self, img_path):
+        """切割验证码图片"""
+        path = img_path.replace('\\', '/')
+        image = Image.open(path)
+        main_box = (0, 0, 334, 343)
+        ver_box = (0, 344, 115, 384)
+
+        log.info(f"处理图片: {path}")
+
+        # 切割主图片
+        region = image.crop(main_box)
+        main_img_path = os.path.join(self.output_dir, 'main_img', 'main_' + path.split('/')[-1])
+        region.save(main_img_path)
+
+        # 切割验证码图片
+        region = image.crop(ver_box)
+        ver_img_path = os.path.join(self.output_dir, 'verificate_img', 'verificate_' + path.split('/')[-1])
+        region.save(ver_img_path)
+
+        return main_img_path, ver_img_path
+
+    def _run_vercode_boxdetect(self, ver_img):
+        """运行验证码边界框检测"""
+        ver_img = ver_img.replace('\\', '/')
+        image = cv2.imread(ver_img, cv2.IMREAD_GRAYSCALE)
+        ret, image1 = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY_INV)
+        box = self._find_image_bbox(image1)
+
+        imagename = ver_img.split('/')[-1].split('.')[0]
+        box_index = 0
+        vercode_box_info = []
+        cls_vercode_box_info = []
+        bbox = np.array([0, 0, 0, 0])
+
+        for starx, endx in box:
+            box_index = box_index + 1
+            region = image[0:40, starx:endx]
+            out_path = os.path.join(self.output_dir, 'chinese', imagename + '_' + str(box_index) + '.jpg')
+            cv2.imwrite(out_path, region)
+            vercode_box_info.append([out_path, bbox])
+
+        cls_vercode_box_info.append(vercode_box_info)
+        return cls_vercode_box_info
+
+    def _judge_orc_result(self, geetcode_bbox_predict_top3, vercode_bbox_predict_top3):
+        """判断OCR结果"""
+        Chinese_Orc_bbox = []
+
+        for vercode_index, ver_bbox in enumerate(vercode_bbox_predict_top3):
+            ver_top3_index = ver_bbox[1]
+            entry = {
+                'vercode_index': -1,
+                'predict_index': -1,
+                'predict_dict': -1,
+                'predict_box': [0, 0, 0, 0],
+                'predict_success': False
+            }
+
+            entry['vercode_index'] = vercode_index
+            entry['predict_success'] = False
+
+            for geetcode_index, geet_bbox in enumerate(geetcode_bbox_predict_top3):
+                geet_top3_index = geet_bbox[1]
+                for ver_pre_index in ver_top3_index:
+                    if ver_pre_index in geet_top3_index:
+                        entry['predict_index'] = ver_pre_index
+                        entry['predict_dict'] = self.label_dict.get(str(ver_pre_index), '未知')
+                        entry['predict_box'] = geet_bbox[0][1]
+                        entry['predict_success'] = True
+                        break
+
+                if entry['predict_success'] is True:
+                    geetcode_bbox_predict_top3.remove(geet_bbox)
+                    break
+
+            Chinese_Orc_bbox.append(entry)
+
+        # 为未匹配的验证码分配预测结果
+        for Orc_index, Orc_txt in enumerate(Chinese_Orc_bbox):
+            if Orc_txt['predict_success'] is False:
+                try:
+                    geet_bbox = geetcode_bbox_predict_top3[0]
+                    Orc_txt['predict_box'] = geet_bbox[0][1]
+                    geetcode_bbox_predict_top3.remove(geet_bbox)
+                except:
+                    log.warning('预测失败')
+
+        return Chinese_Orc_bbox
+
+    def crack_captcha(self, img_path):
+        """
+        破解单个验证码
+
+        Args:
+            img_path: 验证码图片路径
+
+        Returns:
+            dict: 破解结果，包含验证码字符和位置信息
+        """
+        try:
+            # 切割验证码图片
+            main_img, ver_img = self._cut_geetcode(img_path)
+
+            # 导入边界框检测和OCR模块
+            sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeetChinese_crack-master'))
+            import Chinese_bboxdetect as bboxdetect
+            import Chinese_OCR_new as orc
+
+            # 运行边界框检测
+            geetcode_bbox = bboxdetect.run_geetcode_boxdetect(main_img,
+                                                              os.path.join(self.output_dir, 'chinese'),
+                                                              self.bboxdetect_sess, self.bboxdetect_net)
+
+            # 运行验证码边界框检测
+            vercode_bbox = self._run_vercode_boxdetect(ver_img)
+
+            # 运行OCR识别
+            geetcode_bbox_predict_top3 = orc.run_chinese_orc(self.mainimg_sess, self.mainimg_net, geetcode_bbox)
+            vercode_bbox_predict_top3 = orc.run_chinese_orc(self.verimg_sess, self.verimg_net, vercode_bbox)
+
+            # 判断OCR结果
+            Chinese_Orc_bbox = self._judge_orc_result(geetcode_bbox_predict_top3, vercode_bbox_predict_top3)
+
+            # 提取验证码字符
+            captcha_chars = []
+            for item in Chinese_Orc_bbox:
+                if item['predict_success']:
+                    captcha_chars.append(item['predict_dict'])
+
+            # 构建结果
+            result = {
+                'success': True,
+                'captcha_text': ''.join(captcha_chars),
+                'details': Chinese_Orc_bbox,
+                'main_img_path': main_img,
+                'ver_img_path': ver_img
+            }
+
+            log.info(f"验证码破解成功: {result['captcha_text']}")
+            return result
+
+        except Exception as e:
+            log.error(f"验证码破解失败: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'captcha_text': '',
+                'details': []
+            }
+
+    def batch_crack_captchas(self, img_paths):
+        """
+        批量破解验证码
+
+        Args:
+            img_paths: 验证码图片路径列表
+
+        Returns:
+            list: 破解结果列表
+        """
+        results = []
+
+        for img_path in img_paths:
+            result = self.crack_captcha(img_path)
+            results.append(result)
+
+        return results
+
+    def close(self):
+        """关闭会话，释放资源"""
+        try:
+            if hasattr(self, 'bboxdetect_sess'):
+                self.bboxdetect_sess.close()
+            if hasattr(self, 'mainimg_sess'):
+                self.mainimg_sess.close()
+            if hasattr(self, 'verimg_sess'):
+                self.verimg_sess.close()
+            log.info("验证码破解器资源已释放")
+        except Exception as e:
+            log.error(f"释放资源时出错: {e}")
+
+
+def demo_geetest_captcha_cracker():
+    """演示验证码破解功能"""
+    # 创建验证码破解器实例
+    cracker = GeetestCaptchaCracker()
+
+    # 单个验证码破解示例
+    # 注意：这里需要替换为实际的验证码图片路径
+    sample_captcha_path = './data/demo/input/sample.jpg'
+
+    if os.path.exists(sample_captcha_path):
+        result = cracker.crack_captcha(sample_captcha_path)
+        print(f"单个验证码破解结果: {result}")
+    else:
+        print(f"示例验证码图片不存在: {sample_captcha_path}")
+
+    # 批量验证码破解示例
+    captcha_dir = './data/demo/input/'
+    if os.path.exists(captcha_dir):
+        captcha_files = [os.path.join(captcha_dir, f) for f in os.listdir(captcha_dir)
+                         if f.endswith(('.jpg', '.png', '.jpeg'))]
+
+        if captcha_files:
+            batch_results = cracker.batch_crack_captchas(captcha_files)
+            print(f"批量破解了 {len(batch_results)} 个验证码")
+            for i, result in enumerate(batch_results):
+                print(f"验证码 {i + 1}: {result['captcha_text'] if result['success'] else '破解失败'}")
+        else:
+            print("未找到验证码图片文件")
+    else:
+        print(f"验证码目录不存在: {captcha_dir}")
+
+    # 关闭破解器，释放资源
+    cracker.close()
+
+
+def main():
+    """主函数"""
+    print("选择要运行的功能:")
+    print("1. 高并发爬虫演示")
+    print("2. 验证码破解演示")
+
+    choice = input("请输入选项(1/2): ").strip()
+
+    if choice == '1':
+        demo_high_concurrency_crawler()
+    elif choice == '2':
+        demo_geetest_captcha_cracker()
+    else:
+        print("无效选项，运行高并发爬虫演示")
+        demo_high_concurrency_crawler()
 
 
 if __name__ == '__main__':
