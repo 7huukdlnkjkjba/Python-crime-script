@@ -5,26 +5,29 @@ import re
 import csv
 import json
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from datetime import datetime
-from typing import List, Dict, Optional, Union, Iterator, Literal
+from typing import List, Dict, Optional, Union, Iterator, Literal, Set, Tuple
 import logging
 from loguru import logger
 from prettytable import PrettyTable
 from retrying import retry
-import numpy as np
-import cv2
-import tensorflow as tf
-from PIL import Image
+from urllib.parse import urljoin, urlparse, parse_qs
+from collections import deque
+import hashlib
 import os
+from bs4 import BeautifulSoup
+import tldextract
+import concurrent.futures
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('FreeProxyPool')
+logger = logging.getLogger('VoidCrawler')
 
 # 颜色配置
 COLORS = {
@@ -51,7 +54,7 @@ COLORS = {
 class Log:
     log = logger
 
-    def set_log_file(self, filepath: str = 'log.log', rotation: int = 10, level: str = 'DEBUG', color: bool = False):
+    def set_log_file(self, filepath: str = 'void_crawler.log', rotation: int = 10, level: str = 'DEBUG', color: bool = False):
         self.log.add(
             filepath,
             rotation=f'{rotation} MB',
@@ -86,7 +89,7 @@ log = Log()
 class RequestObj:
     def __init__(self, url: str, method: Literal['GET', 'POST', 'get', 'post'], headers: Union[None, dict] = None,
                  params: Union[None, dict] = None, data: Union[None, dict] = None, cookies: Union[None, dict] = None,
-                 proxys: Union[None, dict] = None):
+                 proxys: Union[None, dict] = None, depth: int = 0):
         self.url = url
         self.method = method
         self.headers = headers
@@ -94,6 +97,7 @@ class RequestObj:
         self.data = data
         self.cookies = cookies
         self.proxys = proxys
+        self.depth = depth
         self.request_args = {
             'headers': self.headers,
             'params': self.params,
@@ -107,6 +111,7 @@ class RequestObj:
                 -------------- request for ----------------
                 url  = {self.url}
                 method = {self.method}
+                depth = {self.depth}
                 args = {self.request_args}"""
 
 
@@ -177,8 +182,8 @@ class CrawlBase:
         return True
 
     def do_request(self, url: str, method: Literal['GET', 'POST', 'get', 'post'], headers=None, params=None, data=None,
-                   cookies=None, proxys=None, session: bool = False, middleware=None, is_abandon: bool = False) -> \
-            Union[requests.Response, RequestObj, None]:
+                   cookies=None, proxys=None, session: bool = False, middleware=None, is_abandon: bool = False, depth: int = 0) -> \
+    Union[requests.Response, RequestObj, None]:
         if proxys is None:
             proxys = {}
         if cookies is None:
@@ -191,7 +196,7 @@ class CrawlBase:
             headers = {}
 
         request_obj = RequestObj(url=url, method=method, headers=headers, params=params, cookies=cookies, proxys=proxys,
-                                 data=data)
+                                 data=data, depth=depth)
 
         self.before_request(request_obj)
 
@@ -311,6 +316,7 @@ class FreeProxyPool:
         self.running = False
         self.lock = threading.Lock()
 
+        # 增强代理源
         self.free_proxy_sources = [
             'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
             'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
@@ -319,7 +325,10 @@ class FreeProxyPool:
             'https://www.proxy-list.download/api/v1/get?type=http',
             'https://www.proxy-list.download/api/v1/get?type=https',
             'https://www.proxy-list.download/api/v1/get?type=socks4',
-            'https://www.proxy-list.download/api/v1/get?type=socks5'
+            'https://www.proxy-list.download/api/v1/get?type=socks5',
+            'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all',
+            'https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all&ssl=all&anonymity=all',
+            'https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all&ssl=all&anonymity=all'
         ]
 
         self._start_background_threads()
@@ -609,9 +618,10 @@ def batch_validate_proxies(proxies: List[Dict], max_workers: int = 10) -> List[D
     return valid_proxies
 
 
-class HighConcurrencyCrawler(CrawlBase):
-    def __init__(self, max_workers: int = 10, request_delay: float = 0.1, use_proxies: bool = False,
-                 proxy_list: list = None):
+class VoidCrawler(CrawlBase):
+    def __init__(self, max_workers: int = 20, request_delay: float = 0.5, use_proxies: bool = True,
+                 proxy_list: list = None, max_depth: int = 5, respect_robots_txt: bool = True,
+                 user_agent: str = None, crawl_delay: float = 1.0):
         super().__init__(sleep_interval=request_delay)
         self.max_workers = max_workers
         self.request_delay = request_delay
@@ -623,28 +633,119 @@ class HighConcurrencyCrawler(CrawlBase):
         self.error_count = 0
         self.start_time = None
         self.stats_lock = Lock()
+        self.max_depth = max_depth
+        self.respect_robots_txt = respect_robots_txt
+        self.crawl_delay = crawl_delay
 
-        self.user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59'
+        # URL管理
+        self.visited_urls = set()
+        self.pending_urls = deque()
+        self.url_lock = Lock()
+        
+        # 域名统计和限制
+        self.domain_stats = {}
+        self.domain_limits = {}
+        self.max_urls_per_domain = 100
+        
+        # 内容类型优先级
+        self.content_priority = {
+            'html': 10,
+            'text': 9,
+            'json': 8,
+            'xml': 7,
+            'pdf': 5,
+            'doc': 4,
+            'image': 2,
+            'video': 1,
+            'audio': 1,
+            'other': 0
+        }
+        
+        # URL过滤规则
+        self.url_filters = [
+            self._filter_by_extension,
+            self._filter_by_length,
+            self._filter_by_domain_limit,
+            self._filter_by_content_type
         ]
+        
+        # 增强的用户代理列表
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+            'Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1'
+        ]
+        
+        if user_agent:
+            self.user_agents.insert(0, user_agent)
+            
+        # 初始化代理池
+        if use_proxies and not proxy_list:
+            self.proxy_pool = FreeProxyPool()
+        else:
+            self.proxy_pool = None
+            
+        # 初始化URL优先级队列
+        self.priority_urls = []
+        self.priority_lock = Lock()
+        
+        # 创建数据存储目录
+        self.data_dir = "void_crawler_data"
+        os.makedirs(self.data_dir, exist_ok=True)
+        
+        # 爬虫状态
+        self.is_running = False
+        self.pause_event = threading.Event()
+        self.pause_event.set()  # 初始为运行状态
+        
+        # 增强功能：内容提取器
+        self.content_extractors = {
+            'email': self._extract_emails,
+            'phone': self._extract_phone_numbers,
+            'id_card': self._extract_id_cards,
+            'url': self._extract_urls,
+            'social_media': self._extract_social_media
+        }
+        
+        # 增强功能：爬取规则
+        self.crawl_rules = {
+            'max_retries': 3,
+            'timeout': 30,
+            'follow_redirects': True,
+            'verify_ssl': False,
+            'ignore_robots_txt': not respect_robots_txt
+        }
 
     def get_random_headers(self) -> dict:
         return {
             'User-Agent': random.choice(self.user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
         }
 
     def get_next_proxy(self) -> dict:
+        if self.proxy_pool:
+            proxy = self.proxy_pool.get_proxy()
+            if proxy:
+                proxy_url = f"{proxy['protocol']}://{proxy['ip']}:{proxy['port']}"
+                return {proxy['protocol']: proxy_url}
+        
         if not self.proxy_list:
             return {}
+            
         proxy = self.proxy_list[self.current_proxy_index]
         self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxy_list)
         return {'http': proxy, 'https': proxy}
@@ -663,7 +764,7 @@ class HighConcurrencyCrawler(CrawlBase):
         else:
             request_obj.headers.update(self.get_random_headers())
 
-        if self.use_proxies and self.proxy_list:
+        if self.use_proxies:
             request_obj.proxys = self.get_next_proxy()
 
     def after_request(self, request_obj: RequestObj, response: requests.Response) -> bool:
@@ -673,8 +774,695 @@ class HighConcurrencyCrawler(CrawlBase):
             log.warning(f"请求失败: {request_obj.url} - 状态码: {response.status_code}")
         return success
 
+    def _normalize_url(self, url: str, base_url: str = None) -> str:
+        """标准化URL，处理相对路径和查询参数"""
+        if base_url and not url.startswith(('http://', 'https://')):
+            url = urljoin(base_url, url)
+        
+        # 解析URL
+        parsed = urlparse(url)
+        
+        # 移除默认端口
+        if (parsed.port == 80 and parsed.scheme == 'http') or (parsed.port == 443 and parsed.scheme == 'https'):
+            netloc = parsed.hostname
+        else:
+            netloc = parsed.netloc
+        
+        # 移除片段标识符
+        url = f"{parsed.scheme}://{netloc}{parsed.path}"
+        
+        # 处理查询参数 - 按字母顺序排序
+        if parsed.query:
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            sorted_params = sorted(params.items())
+            query_string = "&".join([f"{k}={v[0]}" for k, v in sorted_params if v])
+            url += f"?{query_string}"
+            
+        return url
+
+    def _get_url_hash(self, url: str) -> str:
+        """获取URL的哈希值，用于去重"""
+        return hashlib.md5(url.encode('utf-8')).hexdigest()
+
+    def _get_domain(self, url: str) -> str:
+        """获取URL的域名"""
+        extracted = tldextract.extract(url)
+        return f"{extracted.domain}.{extracted.suffix}"
+
+    def _filter_by_extension(self, url: str) -> bool:
+        """根据文件扩展名过滤URL"""
+        skip_extensions = [
+            '.css', '.js', '.ico', '.png', '.jpg', '.jpeg', '.gif', 
+            '.svg', '.woff', '.ttf', '.eot', '.mp3', '.mp4', '.avi',
+            '.mov', '.zip', '.rar', '.tar', '.gz', '.7z', '.exe', '.dmg'
+        ]
+        
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        
+        for ext in skip_extensions:
+            if path.endswith(ext):
+                return False
+        return True
+
+    def _filter_by_length(self, url: str) -> bool:
+        """根据URL长度过滤"""
+        return len(url) <= 2048
+
+    def _filter_by_domain_limit(self, url: str) -> bool:
+        """根据域名限制过滤URL"""
+        domain = self._get_domain(url)
+        
+        with self.url_lock:
+            if domain not in self.domain_stats:
+                self.domain_stats[domain] = 0
+                
+            if self.domain_stats[domain] >= self.max_urls_per_domain:
+                return False
+                
+        return True
+
+    def _filter_by_content_type(self, url: str) -> bool:
+        """根据内容类型过滤URL"""
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        
+        # 优先爬取HTML页面
+        if path.endswith(('.html', '.htm', '.aspx', '.php', '.jsp', '.do')) or '?' in parsed.query:
+            return True
+            
+        # 允许其他文本类型
+        if path.endswith(('.txt', '.json', '.xml', '.csv', '.rss', '.atom')):
+            return True
+            
+        # 默认情况下，不爬取媒体文件
+        if path.endswith(('.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx')):
+            return True
+            
+        return False
+
+    def _apply_url_filters(self, url: str) -> bool:
+        """应用所有URL过滤器"""
+        for filter_func in self.url_filters:
+            if not filter_func(url):
+                return False
+        return True
+
+    def _extract_links(self, html: str, base_url: str) -> List[str]:
+        """从HTML中提取链接"""
+        soup = BeautifulSoup(html, 'html.parser')
+        links = set()
+        
+        # 提取a标签的href属性
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href'].strip()
+            if href and not href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+                normalized_url = self._normalize_url(href, base_url)
+                if self._apply_url_filters(normalized_url):
+                    links.add(normalized_url)
+        
+        # 提取frame和iframe的src属性
+        for frame in soup.find_all(['frame', 'iframe'], src=True):
+            src = frame['src'].strip()
+            if src:
+                normalized_url = self._normalize_url(src, base_url)
+                if self._apply_url_filters(normalized_url):
+                    links.add(normalized_url)
+        
+        # 提取link标签的href属性（如RSS、ATOM等）
+        for link in soup.find_all('link', href=True):
+            href = link['href'].strip()
+            if href:
+                normalized_url = self._normalize_url(href, base_url)
+                if self._apply_url_filters(normalized_url):
+                    links.add(normalized_url)
+        
+        # 提取script标签的src属性
+        for script in soup.find_all('script', src=True):
+            src = script['src'].strip()
+            if src:
+                normalized_url = self._normalize_url(src, base_url)
+                if self._apply_url_filters(normalized_url):
+                    links.add(normalized_url)
+        
+        return list(links)
+
+    def _calculate_url_priority(self, url: str, depth: int, content_type: str = None) -> int:
+        """计算URL优先级"""
+        priority = 100  # 基础优先级
+        
+        # 深度越浅，优先级越高
+        priority -= depth * 10
+        
+        # 根据内容类型调整优先级
+        if content_type:
+            for ct, score in self.content_priority.items():
+                if ct in content_type.lower():
+                    priority += score
+                    break
+        else:
+            # 根据URL路径推测内容类型
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            
+            if path.endswith(('.html', '.htm', '.aspx', '.php', '.jsp', '.do')):
+                priority += self.content_priority['html']
+            elif path.endswith(('.txt', '.json', '.xml', '.csv', '.rss', '.atom')):
+                priority += self.content_priority['text']
+            elif path.endswith(('.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx')):
+                priority += self.content_priority['doc']
+            elif any(ext in path for ext in ['.png', '.jpg', '.jpeg', '.gif', '.svg']):
+                priority += self.content_priority['image']
+            elif any(ext in path for ext in ['.mp3', '.wav', '.ogg']):
+                priority += self.content_priority['audio']
+            elif any(ext in path for ext in ['.mp4', '.avi', '.mov', '.flv']):
+                priority += self.content_priority['video']
+        
+        # 根据域名统计调整优先级
+        domain = self._get_domain(url)
+        with self.url_lock:
+            if domain in self.domain_stats:
+                # 同一域名的URL越多，优先级越低
+                priority -= min(50, self.domain_stats[domain] // 10)
+        
+        return max(0, min(100, priority))
+
+    def _add_url_to_queue(self, url: str, depth: int = 0, priority: int = None):
+        """添加URL到爬取队列"""
+        url_hash = self._get_url_hash(url)
+        
+        with self.url_lock:
+            if url_hash in self.visited_urls:
+                return
+                
+            self.visited_urls.add(url_hash)
+            
+            # 更新域名统计
+            domain = self._get_domain(url)
+            if domain not in self.domain_stats:
+                self.domain_stats[domain] = 0
+            self.domain_stats[domain] += 1
+            
+            # 计算优先级
+            if priority is None:
+                priority = self._calculate_url_priority(url, depth)
+            
+            # 添加到优先级队列
+            with self.priority_lock:
+                self.priority_urls.append((priority, depth, url))
+                # 保持队列按优先级排序
+                self.priority_urls.sort(reverse=True)
+            
+            log.debug(f"添加URL到队列: {url} (深度: {depth}, 优先级: {priority})")
+
+    def _get_next_url(self) -> Tuple[str, int]:
+        """从队列中获取下一个URL"""
+        with self.priority_lock:
+            if not self.priority_urls:
+                return None, -1
+                
+            # 获取优先级最高的URL
+            priority, depth, url = self.priority_urls.pop(0)
+            return url, depth
+
+    def _extract_emails(self, text: str) -> List[str]:
+        """提取电子邮件地址"""
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, text)
+        return list(set(emails))
+
+    def _extract_phone_numbers(self, text: str) -> List[str]:
+        """提取手机号码"""
+        phone_patterns = [
+            r'1[3-9]\d{9}',
+            r'(\+86)?1[3-9]\d{9}',
+            r'1[3-9]\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}',
+            r'0\d{2,3}[-\s]?\d{7,8}',
+        ]
+
+        phones = []
+        for pattern in phone_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                phone = re.sub(r'[^\d]', '', str(match))
+                if len(phone) == 11 and phone.startswith(('13', '14', '15', '16', '17', '18', '19')):
+                    phones.append(phone)
+                elif len(phone) in [10, 11, 12] and phone.startswith('0'):
+                    phones.append(phone)
+
+        return list(set(phones))
+
+    def _extract_id_cards(self, text: str) -> List[str]:
+        """提取身份证号码"""
+        id_pattern = r'[1-9]\d{5}(18|19|20)\d{2}((0[1-9])|(1[0-2]))(([0-2][1-9])|10|20|30|31)\d{3}[0-9Xx]'
+        id_cards = []
+        matches = re.findall(id_pattern, text)
+
+        for match in matches:
+            if isinstance(match, tuple):
+                id_card = ''.join(match)
+            else:
+                id_card = match
+
+            if self.validate_id_card(id_card):
+                id_cards.append(id_card.upper())
+
+        return list(set(id_cards))
+
+    def _extract_urls(self, text: str) -> List[str]:
+        """从文本中提取URL"""
+        url_pattern = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[/\w\.-]*\??[/\w\.-=&%]*'
+        urls = re.findall(url_pattern, text)
+        return list(set(urls))
+
+    def _extract_social_media(self, text: str) -> Dict[str, List[str]]:
+        """提取社交媒体账号"""
+        social_media = {
+            'wechat': [],
+            'weibo': [],
+            'qq': [],
+            'douyin': [],
+            'kuaishou': []
+        }
+
+        # 微信
+        wechat_pattern = r'微信号[:：\s]+([a-zA-Z0-9_-]+)'
+        wechat_matches = re.findall(wechat_pattern, text)
+        social_media['wechat'].extend(wechat_matches)
+
+        # 微博
+        weibo_pattern = r'微博[:：\s]+@?([a-zA-Z0-9_-]+)'
+        weibo_matches = re.findall(weibo_pattern, text)
+        social_media['weibo'].extend(weibo_matches)
+
+        # QQ
+        qq_pattern = r'QQ[:：\s]+([0-9]+)'
+        qq_matches = re.findall(qq_pattern, text)
+        social_media['qq'].extend(qq_matches)
+
+        # 抖音
+        douyin_pattern = r'抖音[:：\s]+@?([a-zA-Z0-9_-]+)'
+        douyin_matches = re.findall(douyin_pattern, text)
+        social_media['douyin'].extend(douyin_matches)
+
+        # 快手
+        kuaishou_pattern = r'快手[:：\s]+@?([a-zA-Z0-9_-]+)'
+        kuaishou_matches = re.findall(kuaishou_pattern, text)
+        social_media['kuaishou'].extend(kuaishou_matches)
+
+        # 去重
+        for platform in social_media:
+            social_media[platform] = list(set(social_media[platform]))
+
+        return social_media
+
+    def _process_page(self, url: str, depth: int) -> Dict:
+        """处理单个页面"""
+        result = {
+            'url': url,
+            'depth': depth,
+            'status': 'unknown',
+            'content_type': None,
+            'content_length': 0,
+            'links': [],
+            'data': None,
+            'error': None,
+            'extracted_content': {
+                'emails': [],
+                'phones': [],
+                'id_cards': [],
+                'urls': [],
+                'social_media': {}
+            }
+        }
+        
+        try:
+            # 发送请求
+            response = self.do_request(url=url, method='GET', depth=depth)
+            
+            if not response:
+                result['status'] = 'error'
+                result['error'] = 'No response'
+                return result
+                
+            result['status'] = 'success'
+            result['content_type'] = response.headers.get('Content-Type', '').split(';')[0]
+            result['content_length'] = len(response.content)
+            
+            # 如果是HTML页面，提取链接
+            if 'text/html' in result['content_type']:
+                try:
+                    links = self._extract_links(response.text, url)
+                    result['links'] = links
+                    
+                    # 将新链接添加到队列
+                    for link in links:
+                        if depth + 1 <= self.max_depth:
+                            self._add_url_to_queue(link, depth + 1)
+                except Exception as e:
+                    log.warning(f"提取链接失败: {url} - {e}")
+            
+            # 保存内容
+            try:
+                content_type = result['content_type']
+                file_ext = '.html'
+                
+                if 'text/plain' in content_type:
+                    file_ext = '.txt'
+                elif 'application/json' in content_type:
+                    file_ext = '.json'
+                elif 'application/xml' in content_type:
+                    file_ext = '.xml'
+                elif 'application/pdf' in content_type:
+                    file_ext = '.pdf'
+                
+                # 创建基于URL的文件名
+                url_hash = self._get_url_hash(url)
+                filename = f"{url_hash}{file_ext}"
+                filepath = os.path.join(self.data_dir, filename)
+                
+                with open(filepath, 'wb') as f:
+                    f.write(response.content)
+                
+                result['saved_path'] = filepath
+                log.debug(f"保存内容: {filepath}")
+            except Exception as e:
+                log.warning(f"保存内容失败: {url} - {e}")
+                
+            # 提取页面数据
+            if 'text/html' in content_type or 'text/plain' in content_type:
+                text_content = response.text
+                result['data'] = text_content
+                
+                # 提取各种内容
+                result['extracted_content']['emails'] = self._extract_emails(text_content)
+                result['extracted_content']['phones'] = self._extract_phone_numbers(text_content)
+                result['extracted_content']['id_cards'] = self._extract_id_cards(text_content)
+                result['extracted_content']['urls'] = self._extract_urls(text_content)
+                result['extracted_content']['social_media'] = self._extract_social_media(text_content)
+                
+                # 保存提取的内容
+                self._save_extracted_content(url, result['extracted_content'])
+            else:
+                result['data'] = f"<Binary data: {result['content_length']} bytes>"
+                
+        except Exception as e:
+            result['status'] = 'error'
+            result['error'] = str(e)
+            log.error(f"处理页面失败: {url} - {e}")
+            
+        return result
+
+    def _save_extracted_content(self, url: str, extracted_content: Dict):
+        """保存提取的内容"""
+        url_hash = self._get_url_hash(url)
+        
+        # 保存电子邮件
+        if extracted_content['emails']:
+            email_file = os.path.join(self.data_dir, f"{url_hash}_emails.csv")
+            with open(email_file, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Email', 'Source URL', 'Extract Time'])
+                for email in extracted_content['emails']:
+                    writer.writerow([email, url, datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+        
+        # 保存手机号
+        if extracted_content['phones']:
+            phone_file = os.path.join(self.data_dir, f"{url_hash}_phones.csv")
+            with open(phone_file, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Phone', 'Source URL', 'Extract Time'])
+                for phone in extracted_content['phones']:
+                    writer.writerow([phone, url, datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+        
+        # 保存身份证信息
+        if extracted_content['id_cards']:
+            id_file = os.path.join(self.data_dir, f"{url_hash}_id_cards.csv")
+            with open(id_file, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['ID Card', 'Source URL', 'Extract Time'])
+                for id_card in extracted_content['id_cards']:
+                    writer.writerow([id_card, url, datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+        
+        # 保存社交媒体账号
+        if any(extracted_content['social_media'].values()):
+            social_file = os.path.join(self.data_dir, f"{url_hash}_social_media.csv")
+            with open(social_file, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Platform', 'Account', 'Source URL', 'Extract Time'])
+                for platform, accounts in extracted_content['social_media'].items():
+                    for account in accounts:
+                        writer.writerow([platform, account, url, datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+
+    def start_crawling(self, seed_urls: List[str], max_pages: int = 1000):
+        """开始爬取"""
+        self.is_running = True
+        self.start_time = time.time()
+        
+        # 添加种子URL到队列
+        for url in seed_urls:
+            self._add_url_to_queue(url, 0, 100)  # 种子URL优先级最高
+        
+        log.info(f"开始虚空爬取，种子URL: {len(seed_urls)}，最大页面数: {max_pages}")
+        
+        # 创建线程池
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = []
+            processed_count = 0
+            
+            while self.is_running and processed_count < max_pages:
+                # 检查暂停状态
+                self.pause_event.wait()
+                
+                # 获取下一个URL
+                url, depth = self._get_next_url()
+                if not url:
+                    if not futures:  # 没有正在处理的任务且队列为空
+                        break
+                    time.sleep(0.1)
+                    continue
+                
+                # 提交任务
+                future = executor.submit(self._process_page, url, depth)
+                futures.append(future)
+                
+                # 限制并发任务数量
+                if len(futures) >= self.max_workers * 2:
+                    completed, _ = concurrent.futures.wait(
+                        futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for f in completed:
+                        try:
+                            result = f.result()
+                            processed_count += 1
+                            
+                            # 定期打印统计信息
+                            if processed_count % 50 == 0:
+                                self._print_stats()
+                        except Exception as e:
+                            log.error(f"任务执行失败: {e}")
+                    
+                    # 从列表中移除已完成的任务
+                    futures = [f for f in futures if not f.done()]
+                
+                # 控制添加新URL的速度
+                time.sleep(self.request_delay)
+            
+            # 等待所有任务完成
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    processed_count += 1
+                except Exception as e:
+                    log.error(f"任务执行失败: {e}")
+        
+        self._print_stats()
+        log.info(f"虚空爬取完成，共处理 {processed_count} 个页面")
+
+    def pause_crawling(self):
+        """暂停爬取"""
+        self.pause_event.clear()
+        log.info("爬取已暂停")
+
+    def resume_crawling(self):
+        """恢复爬取"""
+        self.pause_event.set()
+        log.info("爬取已恢复")
+
+    def stop_crawling(self):
+        """停止爬取"""
+        self.is_running = False
+        self.pause_event.set()
+        log.info("爬取已停止")
+
+    def _print_stats(self):
+        """打印统计信息"""
+        if self.start_time:
+            elapsed_time = time.time() - self.start_time
+            requests_per_second = self.request_count / elapsed_time if elapsed_time > 0 else 0
+
+            with self.url_lock:
+                total_urls = len(self.visited_urls)
+                pending_urls = len(self.priority_urls)
+                top_domains = sorted(self.domain_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            log.info(f"""
+=== 虚空爬虫统计信息 ===
+总请求数: {self.request_count}
+成功请求: {self.success_count}
+失败请求: {self.error_count}
+成功率: {self.success_count / self.request_count * 100:.2f}%
+已访问URL: {total_urls}
+待处理URL: {pending_urls}
+爬取深度: {self.max_depth}
+总耗时: {elapsed_time:.2f}秒
+平均请求速度: {requests_per_second:.2f} 请求/秒
+热门域名: {', '.join([f'{domain}({count})' for domain, count in top_domains])}
+==================
+            """)
+
+    def set_max_depth(self, depth: int):
+        """设置最大爬取深度"""
+        self.max_depth = depth
+        log.info(f"最大爬取深度已设置为: {depth}")
+
+    def set_max_urls_per_domain(self, limit: int):
+        """设置每个域名的最大URL数量"""
+        self.max_urls_per_domain = limit
+        log.info(f"每个域名的最大URL数量已设置为: {limit}")
+
+    def set_domain_limit(self, domain: str, limit: int):
+        """设置特定域名的URL限制"""
+        self.domain_limits[domain] = limit
+        log.info(f"域名 {domain} 的URL限制已设置为: {limit}")
+
+    def validate_id_card(self, id_card: str) -> bool:
+        """验证身份证号码"""
+        if len(id_card) != 18:
+            return False
+
+        factors = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
+        check_codes = ['1', '0', 'X', '9', '8', '7', '6', '5', '4', '3', '2']
+
+        try:
+            total = sum(int(id_card[i]) * factors[i] for i in range(17))
+            check_code = check_codes[total % 11]
+            return id_card[17].upper() == check_code
+        except:
+            return False
+
+    def parse_id_card_info(self, id_card: str) -> Dict[str, str]:
+        """解析身份证信息"""
+        if not self.validate_id_card(id_card):
+            return {}
+
+        area_code = id_card[:6]
+        birth_date = id_card[6:14]
+
+        try:
+            birth_datetime = datetime.strptime(birth_date, '%Y%m%d')
+            birth_formatted = birth_datetime.strftime('%Y-%m-%d')
+            age = datetime.now().year - birth_datetime.year
+        except:
+            birth_formatted = birth_date
+            age = '未知'
+
+        gender_num = int(id_card[16])
+        gender = '男' if gender_num % 2 == 1 else '女'
+
+        return {
+            'id_card': id_card,
+            'area_code': area_code,
+            'birth_date': birth_formatted,
+            'age': str(age),
+            'gender': gender,
+            'is_valid': '是'
+        }
+
+    def crawl_phone_and_id_from_urls(self, urls: List[str], method: str = 'GET', save_to_file: str = None) -> Dict[
+        str, List]:
+        """从URL中爬取手机号和身份证信息"""
+        results = self.crawl_urls_concurrently(urls, method)
+
+        all_phones = []
+        all_id_cards = []
+        detailed_id_info = []
+
+        for result in results:
+            if result['status'] == 'success' and result['data']:
+                text = result['data'] if isinstance(result['data'], str) else str(result['data'])
+
+                phones = self._extract_phone_numbers(text)
+                all_phones.extend(phones)
+
+                id_cards = self._extract_id_cards(text)
+                all_id_cards.extend(id_cards)
+
+                for id_card in id_cards:
+                    id_info = self.parse_id_card_info(id_card)
+                    if id_info:
+                        id_info.update({
+                            'source_url': result['url'],
+                            'crawl_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        })
+                        detailed_id_info.append(id_info)
+
+        all_phones = list(set(all_phones))
+        all_id_cards = list(set(all_id_cards))
+
+        if save_to_file:
+            self._save_phone_id_data(all_phones, detailed_id_info, save_to_file)
+
+        return {
+            'phones': all_phones,
+            'id_cards': all_id_cards,
+            'detailed_id_info': detailed_id_info
+        }
+
+    def _save_phone_id_data(self, phones: List[str], id_info: List[Dict], filename: str):
+        """保存手机号和身份证数据"""
+        if phones:
+            phone_file = f'phones_{filename}'
+            with open(phone_file, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['手机号', '提取时间'])
+                for phone in phones:
+                    writer.writerow([phone, datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+            log.info(f'手机号数据已保存到: {phone_file}')
+
+        if id_info:
+            id_file = f'id_cards_{filename}'
+            with open(id_file, 'w', encoding='utf-8', newline='') as f:
+                if id_info:
+                    fieldnames = list(id_info[0].keys())
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(id_info)
+            log.info(f'身份证数据已保存到: {id_file}')
+
+    def crawl_from_file(self, file_path: str, url_pattern: str = r'https?://[^\s]+', save_to_file: str = None) -> Dict[
+        str, List]:
+        """从文件中读取URL并进行爬取"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            urls = re.findall(url_pattern, content)
+            urls = list(set(urls))
+
+            if not urls:
+                log.warning('未在文件中找到URL')
+                return {'phones': [], 'id_cards': [], 'detailed_id_info': []}
+
+            log.info(f'从文件中提取到 {len(urls)} 个URL')
+            return self.crawl_phone_and_id_from_urls(urls, save_to_file=save_to_file)
+
+        except Exception as e:
+            log.error(f'读取文件失败: {e}')
+            return {'phones': [], 'id_cards': [], 'detailed_id_info': []}
+
     def crawl_urls_concurrently(self, urls: list, method: str = 'GET', params_list: list = None, data_list: list = None,
                                 callback: callable = None) -> list:
+        """并发爬取URL列表"""
         if params_list is None:
             params_list = [{}] * len(urls)
         if data_list is None:
@@ -732,6 +1520,7 @@ class HighConcurrencyCrawler(CrawlBase):
 
     def crawl_with_pagination(self, base_url: str, page_param: str, start_page: int, end_page: int, method: str = 'GET',
                               callback: callable = None) -> list:
+        """爬取分页内容"""
         urls = []
         params_list = []
 
@@ -741,564 +1530,116 @@ class HighConcurrencyCrawler(CrawlBase):
 
         return self.crawl_urls_concurrently(urls, method, params_list, callback=callback)
 
-    def _print_stats(self):
-        if self.start_time:
-            elapsed_time = time.time() - self.start_time
-            requests_per_second = self.request_count / elapsed_time if elapsed_time > 0 else 0
-
-            log.info(f"""
-=== 爬虫统计信息 ===
-总请求数: {self.request_count}
-成功请求: {self.success_count}
-失败请求: {self.error_count}
-成功率: {self.success_count / self.request_count * 100:.2f}%
-总耗时: {elapsed_time:.2f}秒
-平均请求速度: {requests_per_second:.2f} 请求/秒
-==================
-            """)
-
     def set_proxy_list(self, proxy_list: list):
+        """设置代理列表"""
         self.proxy_list = proxy_list
         self.use_proxies = bool(proxy_list)
 
     def set_max_workers(self, max_workers: int):
+        """设置最大工作线程数"""
         self.max_workers = max_workers
 
     def set_request_delay(self, delay: float):
+        """设置请求延迟"""
         self.request_delay = delay
         self.control_sleep_time = delay
 
-    def extract_phone_numbers(self, text: str) -> List[str]:
-        phone_patterns = [
-            r'1[3-9]\d{9}',
-            r'(\+86)?1[3-9]\d{9}',
-            r'1[3-9]\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}',
-        ]
+    def generate_crawl_report(self) -> Dict:
+        """生成爬取报告"""
+        if not self.start_time:
+            return {"error": "爬取尚未开始"}
 
-        phones = []
-        for pattern in phone_patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                phone = re.sub(r'[^\d]', '', str(match))
-                if len(phone) == 11 and phone.startswith(('13', '14', '15', '16', '17', '18', '19')):
-                    phones.append(phone)
+        elapsed_time = time.time() - self.start_time
+        requests_per_second = self.request_count / elapsed_time if elapsed_time > 0 else 0
 
-        return list(set(phones))
+        with self.url_lock:
+            total_urls = len(self.visited_urls)
+            pending_urls = len(self.priority_urls)
+            top_domains = sorted(self.domain_stats.items(), key=lambda x: x[1], reverse=True)[:10]
 
-    def extract_id_cards(self, text: str) -> List[str]:
-        id_pattern = r'[1-9]\d{5}(18|19|20)\d{2}((0[1-9])|(1[0-2]))(([0-2][1-9])|10|20|30|31)\d{3}[0-9Xx]'
-        id_cards = []
-        matches = re.findall(id_pattern, text)
-
-        for match in matches:
-            if isinstance(match, tuple):
-                id_card = ''.join(match)
-            else:
-                id_card = match
-
-            if self.validate_id_card(id_card):
-                id_cards.append(id_card.upper())
-
-        return list(set(id_cards))
-
-    def validate_id_card(self, id_card: str) -> bool:
-        if len(id_card) != 18:
-            return False
-
-        factors = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
-        check_codes = ['1', '0', 'X', '9', '8', '7', '6', '5', '4', '3', '2']
-
-        try:
-            total = sum(int(id_card[i]) * factors[i] for i in range(17))
-            check_code = check_codes[total % 11]
-            return id_card[17].upper() == check_code
-        except:
-            return False
-
-    def parse_id_card_info(self, id_card: str) -> Dict[str, str]:
-        if not self.validate_id_card(id_card):
-            return {}
-
-        area_code = id_card[:6]
-        birth_date = id_card[6:14]
-
-        try:
-            birth_datetime = datetime.strptime(birth_date, '%Y%m%d')
-            birth_formatted = birth_datetime.strftime('%Y-%m-%d')
-            age = datetime.now().year - birth_datetime.year
-        except:
-            birth_formatted = birth_date
-            age = '未知'
-
-        gender_num = int(id_card[16])
-        gender = '男' if gender_num % 2 == 1 else '女'
-
-        return {
-            'id_card': id_card,
-            'area_code': area_code,
-            'birth_date': birth_formatted,
-            'age': str(age),
-            'gender': gender,
-            'is_valid': '是'
+        report = {
+            "summary": {
+                "total_requests": self.request_count,
+                "successful_requests": self.success_count,
+                "failed_requests": self.error_count,
+                "success_rate": f"{self.success_count / self.request_count * 100:.2f}%" if self.request_count > 0 else "0%",
+                "visited_urls": total_urls,
+                "pending_urls": pending_urls,
+                "max_depth": self.max_depth,
+                "elapsed_time": f"{elapsed_time:.2f}秒",
+                "requests_per_second": f"{requests_per_second:.2f} 请求/秒"
+            },
+            "top_domains": [{"domain": domain, "count": count} for domain, count in top_domains],
+            "proxy_stats": self.proxy_pool.get_stats() if self.proxy_pool else {},
+            "data_dir": self.data_dir
         }
 
-    def crawl_phone_and_id_from_urls(self, urls: List[str], method: str = 'GET', save_to_file: str = None) -> Dict[
-        str, List]:
-        results = self.crawl_urls_concurrently(urls, method)
-
-        all_phones = []
-        all_id_cards = []
-        detailed_id_info = []
-
-        for result in results:
-            if result['status'] == 'success' and result['data']:
-                text = result['data'] if isinstance(result['data'], str) else str(result['data'])
-
-                phones = self.extract_phone_numbers(text)
-                all_phones.extend(phones)
-
-                id_cards = self.extract_id_cards(text)
-                all_id_cards.extend(id_cards)
-
-                for id_card in id_cards:
-                    id_info = self.parse_id_card_info(id_card)
-                    if id_info:
-                        id_info.update({
-                            'source_url': result['url'],
-                            'crawl_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        })
-                        detailed_id_info.append(id_info)
-
-        all_phones = list(set(all_phones))
-        all_id_cards = list(set(all_id_cards))
-
-        if save_to_file:
-            self._save_phone_id_data(all_phones, detailed_id_info, save_to_file)
-
-        return {
-            'phones': all_phones,
-            'id_cards': all_id_cards,
-            'detailed_id_info': detailed_id_info
-        }
-
-    def _save_phone_id_data(self, phones: List[str], id_info: List[Dict], filename: str):
-        if phones:
-            phone_file = f'phones_{filename}'
-            with open(phone_file, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['手机号', '提取时间'])
-                for phone in phones:
-                    writer.writerow([phone, datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
-            log.info(f'手机号数据已保存到: {phone_file}')
-
-        if id_info:
-            id_file = f'id_cards_{filename}'
-            with open(id_file, 'w', encoding='utf-8', newline='') as f:
-                if id_info:
-                    fieldnames = list(id_info[0].keys())
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(id_info)
-            log.info(f'身份证数据已保存到: {id_file}')
-
-    def crawl_from_file(self, file_path: str, url_pattern: str = r'https?://[^\s]+', save_to_file: str = None) -> Dict[
-        str, List]:
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            urls = re.findall(url_pattern, content)
-            urls = list(set(urls))
-
-            if not urls:
-                log.warning('未在文件中找到URL')
-                return {'phones': [], 'id_cards': [], 'detailed_id_info': []}
-
-            log.info(f'从文件中提取到 {len(urls)} 个URL')
-            return self.crawl_phone_and_id_from_urls(urls, save_to_file=save_to_file)
-
-        except Exception as e:
-            log.error(f'读取文件失败: {e}')
-            return {'phones': [], 'id_cards': [], 'detailed_id_info': []}
-
-
-def demo_high_concurrency_crawler():
-    crawler = HighConcurrencyCrawler(max_workers=10, request_delay=0.0001, use_proxies=False)
-
-    urls = ['https://www.baidu.com', 'https://www.qq.com', 'https://www.taobao.com'] * 3
-
-    results = crawler.crawl_urls_concurrently(urls)
-
-    for result in results:
-        print(f"URL: {result['url']}, 状态: {result['status']}")
-
-    test_text = """
-    我的手机号是13812345678，另一个是+8613912345678，
-    身份证号是110101199001011234，另一个是11010119900307987X
-    """
-
-    phones = crawler.extract_phone_numbers(test_text)
-    print(f"提取到的手机号: {phones}")
-
-    id_cards = crawler.extract_id_cards(test_text)
-    print(f"提取到的身份证: {id_cards}")
-
-    for id_card in id_cards:
-        info = crawler.parse_id_card_info(id_card)
-        print(f"身份证信息: {info}")
-
-
-class GeetestCaptchaCracker:
-    """验证码破解类，借鉴crack_geetest-master项目的验证码破解逻辑"""
-
-    def __init__(self, mainimg_checkpoint_path=None, verimg_checkpoint_path=None, output_dir='./output/'):
-        """
-        初始化验证码破解器
-
-        Args:
-            mainimg_checkpoint_path: 主图片模型路径
-            verimg_checkpoint_path: 验证码图片模型路径
-            output_dir: 输出目录
-        """
-        self.mainimg_checkpoint_path = mainimg_checkpoint_path or './output/chinese/mainimg/'
-        self.verimg_checkpoint_path = verimg_checkpoint_path or './output/chinese/verimg/'
-        self.output_dir = output_dir
-
-        # 创建输出目录
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, 'main_img'), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, 'verificate_img'), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, 'chinese'), exist_ok=True)
-
-        # 初始化模型
-        self._initialize_models()
-
-    def _load_label_dict(self):
-        """加载标签字典"""
-        label_dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       'GeetChinese_crack-master', 'data', 'label_dict.txt')
-
-        if not os.path.exists(label_dict_path):
-            # 如果标签字典不存在，创建一个默认的
-            label_dict = {
-                "0": "一", "1": "二", "2": "三", "3": "四", "4": "五",
-                "5": "六", "6": "七", "7": "八", "8": "九", "9": "十",
-                "10": "百", "11": "千", "12": "万", "13": "亿", "14": "零"
-            }
-            # 保存标签字典
-            os.makedirs(os.path.dirname(label_dict_path), exist_ok=True)
-            with open(label_dict_path, 'w', encoding='utf-8') as f:
-                for k, v in label_dict.items():
-                    f.write(f"{k}:{v}\n")
-        else:
-            # 加载标签字典
-            label_dict = {}
-            with open(label_dict_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    if ':' in line:
-                        k, v = line.strip().split(':', 1)
-                        label_dict[k] = v
-
-        return label_dict
-
-    def _initialize_models(self):
-        """初始化模型"""
-        try:
-            # 导入边界框检测模块
-            sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeetChinese_crack-master'))
-            import Chinese_bboxdetect as bboxdetect
-            import Chinese_OCR_new as orc
-
-            # 加载Faster R-CNN网络
-            self.bboxdetect_sess, self.bboxdetect_net = bboxdetect.load_faster_rcnn_network()
-
-            # 加载OCR网络
-            self.mainimg_graph = tf.Graph()
-            self.mainimg_sess, self.mainimg_net = orc.load_chinese_orc_net(
-                self.mainimg_graph, self.mainimg_checkpoint_path)
-
-            self.verimg_graph = tf.Graph()
-            self.verimg_sess, self.verimg_net = orc.load_chinese_orc_net(
-                self.verimg_graph, self.verimg_checkpoint_path)
-
-            # 加载标签字典
-            self.label_dict = self._load_label_dict()
-
-            log.info("验证码破解模型初始化成功")
-        except Exception as e:
-            log.error(f"验证码破解模型初始化失败: {e}")
-            raise
-
-    def _find_image_bbox(self, img):
-        """查找图像边界框"""
-        v_sum = np.sum(img, axis=0)
-        start_i = None
-        end_i = None
-        minimun_range = 10
-        maximun_range = 20
-        min_val = 10
-        peek_ranges = []
-        ser_val = 0
-
-        # 从左往右扫描，遇到非零像素点就以此为字体的左边界
-        for i, val in enumerate(v_sum):
-            # 定位第一个字体的起始位置
-            if val > min_val and start_i is None:
-                start_i = i
-                ser_val = 0
-            # 继续扫描到字体，继续往右扫描
-            elif val > min_val and start_i is not None:
-                ser_val = 0
-            # 扫描到背景，判断空白长度
-            elif val <= min_val and start_i is not None:
-                ser_val = ser_val + 1
-                if (i - start_i >= minimun_range and ser_val > 2) or (i - start_i >= maximun_range):
-                    end_i = i
-                    if start_i > 5:
-                        start_i = start_i - 5
-                    peek_ranges.append((start_i, end_i + 2))
-                    start_i = None
-                    end_i = None
-            # 扫描到背景，继续扫描下一个字体
-            elif val <= min_val and start_i is None:
-                ser_val = ser_val + 1
-            else:
-                raise ValueError("cannot parse this case...")
-
-        return peek_ranges
-
-    def _cut_geetcode(self, img_path):
-        """切割验证码图片"""
-        path = img_path.replace('\\', '/')
-        image = Image.open(path)
-        main_box = (0, 0, 334, 343)
-        ver_box = (0, 344, 115, 384)
-
-        log.info(f"处理图片: {path}")
-
-        # 切割主图片
-        region = image.crop(main_box)
-        main_img_path = os.path.join(self.output_dir, 'main_img', 'main_' + path.split('/')[-1])
-        region.save(main_img_path)
-
-        # 切割验证码图片
-        region = image.crop(ver_box)
-        ver_img_path = os.path.join(self.output_dir, 'verificate_img', 'verificate_' + path.split('/')[-1])
-        region.save(ver_img_path)
-
-        return main_img_path, ver_img_path
-
-    def _run_vercode_boxdetect(self, ver_img):
-        """运行验证码边界框检测"""
-        ver_img = ver_img.replace('\\', '/')
-        image = cv2.imread(ver_img, cv2.IMREAD_GRAYSCALE)
-        ret, image1 = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY_INV)
-        box = self._find_image_bbox(image1)
-
-        imagename = ver_img.split('/')[-1].split('.')[0]
-        box_index = 0
-        vercode_box_info = []
-        cls_vercode_box_info = []
-        bbox = np.array([0, 0, 0, 0])
-
-        for starx, endx in box:
-            box_index = box_index + 1
-            region = image[0:40, starx:endx]
-            out_path = os.path.join(self.output_dir, 'chinese', imagename + '_' + str(box_index) + '.jpg')
-            cv2.imwrite(out_path, region)
-            vercode_box_info.append([out_path, bbox])
-
-        cls_vercode_box_info.append(vercode_box_info)
-        return cls_vercode_box_info
-
-    def _judge_orc_result(self, geetcode_bbox_predict_top3, vercode_bbox_predict_top3):
-        """判断OCR结果"""
-        Chinese_Orc_bbox = []
-
-        for vercode_index, ver_bbox in enumerate(vercode_bbox_predict_top3):
-            ver_top3_index = ver_bbox[1]
-            entry = {
-                'vercode_index': -1,
-                'predict_index': -1,
-                'predict_dict': -1,
-                'predict_box': [0, 0, 0, 0],
-                'predict_success': False
-            }
-
-            entry['vercode_index'] = vercode_index
-            entry['predict_success'] = False
-
-            for geetcode_index, geet_bbox in enumerate(geetcode_bbox_predict_top3):
-                geet_top3_index = geet_bbox[1]
-                for ver_pre_index in ver_top3_index:
-                    if ver_pre_index in geet_top3_index:
-                        entry['predict_index'] = ver_pre_index
-                        entry['predict_dict'] = self.label_dict.get(str(ver_pre_index), '未知')
-                        entry['predict_box'] = geet_bbox[0][1]
-                        entry['predict_success'] = True
-                        break
-
-                if entry['predict_success'] is True:
-                    geetcode_bbox_predict_top3.remove(geet_bbox)
-                    break
-
-            Chinese_Orc_bbox.append(entry)
-
-        # 为未匹配的验证码分配预测结果
-        for Orc_index, Orc_txt in enumerate(Chinese_Orc_bbox):
-            if Orc_txt['predict_success'] is False:
-                try:
-                    geet_bbox = geetcode_bbox_predict_top3[0]
-                    Orc_txt['predict_box'] = geet_bbox[0][1]
-                    geetcode_bbox_predict_top3.remove(geet_bbox)
-                except:
-                    log.warning('预测失败')
-
-        return Chinese_Orc_bbox
-
-    def crack_captcha(self, img_path):
-        """
-        破解单个验证码
-
-        Args:
-            img_path: 验证码图片路径
-
-        Returns:
-            dict: 破解结果，包含验证码字符和位置信息
-        """
-        try:
-            # 切割验证码图片
-            main_img, ver_img = self._cut_geetcode(img_path)
-
-            # 导入边界框检测和OCR模块
-            sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GeetChinese_crack-master'))
-            import Chinese_bboxdetect as bboxdetect
-            import Chinese_OCR_new as orc
-
-            # 运行边界框检测
-            geetcode_bbox = bboxdetect.run_geetcode_boxdetect(main_img,
-                                                              os.path.join(self.output_dir, 'chinese'),
-                                                              self.bboxdetect_sess, self.bboxdetect_net)
-
-            # 运行验证码边界框检测
-            vercode_bbox = self._run_vercode_boxdetect(ver_img)
-
-            # 运行OCR识别
-            geetcode_bbox_predict_top3 = orc.run_chinese_orc(self.mainimg_sess, self.mainimg_net, geetcode_bbox)
-            vercode_bbox_predict_top3 = orc.run_chinese_orc(self.verimg_sess, self.verimg_net, vercode_bbox)
-
-            # 判断OCR结果
-            Chinese_Orc_bbox = self._judge_orc_result(geetcode_bbox_predict_top3, vercode_bbox_predict_top3)
-
-            # 提取验证码字符
-            captcha_chars = []
-            for item in Chinese_Orc_bbox:
-                if item['predict_success']:
-                    captcha_chars.append(item['predict_dict'])
-
-            # 构建结果
-            result = {
-                'success': True,
-                'captcha_text': ''.join(captcha_chars),
-                'details': Chinese_Orc_bbox,
-                'main_img_path': main_img,
-                'ver_img_path': ver_img
-            }
-
-            log.info(f"验证码破解成功: {result['captcha_text']}")
-            return result
-
-        except Exception as e:
-            log.error(f"验证码破解失败: {e}")
-            return {
-                'success': False,
-                'error': str(e),
-                'captcha_text': '',
-                'details': []
-            }
-
-    def batch_crack_captchas(self, img_paths):
-        """
-        批量破解验证码
-
-        Args:
-            img_paths: 验证码图片路径列表
-
-        Returns:
-            list: 破解结果列表
-        """
-        results = []
-
-        for img_path in img_paths:
-            result = self.crack_captcha(img_path)
-            results.append(result)
-
-        return results
-
-    def close(self):
-        """关闭会话，释放资源"""
-        try:
-            if hasattr(self, 'bboxdetect_sess'):
-                self.bboxdetect_sess.close()
-            if hasattr(self, 'mainimg_sess'):
-                self.mainimg_sess.close()
-            if hasattr(self, 'verimg_sess'):
-                self.verimg_sess.close()
-            log.info("验证码破解器资源已释放")
-        except Exception as e:
-            log.error(f"释放资源时出错: {e}")
-
-
-def demo_geetest_captcha_cracker():
-    """演示验证码破解功能"""
-    # 创建验证码破解器实例
-    cracker = GeetestCaptchaCracker()
-
-    # 单个验证码破解示例
-    # 注意：这里需要替换为实际的验证码图片路径
-    sample_captcha_path = './data/demo/input/sample.jpg'
-
-    if os.path.exists(sample_captcha_path):
-        result = cracker.crack_captcha(sample_captcha_path)
-        print(f"单个验证码破解结果: {result}")
-    else:
-        print(f"示例验证码图片不存在: {sample_captcha_path}")
-
-    # 批量验证码破解示例
-    captcha_dir = './data/demo/input/'
-    if os.path.exists(captcha_dir):
-        captcha_files = [os.path.join(captcha_dir, f) for f in os.listdir(captcha_dir)
-                         if f.endswith(('.jpg', '.png', '.jpeg'))]
-
-        if captcha_files:
-            batch_results = cracker.batch_crack_captchas(captcha_files)
-            print(f"批量破解了 {len(batch_results)} 个验证码")
-            for i, result in enumerate(batch_results):
-                print(f"验证码 {i + 1}: {result['captcha_text'] if result['success'] else '破解失败'}")
-        else:
-            print("未找到验证码图片文件")
-    else:
-        print(f"验证码目录不存在: {captcha_dir}")
-
-    # 关闭破解器，释放资源
-    cracker.close()
+        return report
+
+
+def demo_void_crawler():
+    """虚空爬虫演示"""
+    # 创建虚空爬虫实例
+    crawler = VoidCrawler(
+        max_workers=10,
+        request_delay=0.5,
+        use_proxies=True,
+        max_depth=3,
+        respect_robots_txt=True
+    )
+    
+    # 设置种子URL
+    seed_urls = [
+        'https://www.baidu.com',
+        'https://www.qq.com',
+        'https://www.sina.com.cn'
+    ]
+    
+    # 开始爬取
+    crawler.start_crawling(seed_urls, max_pages=100)
+    
+    # 打印最终统计信息
+    crawler._print_stats()
+    
+    # 生成爬取报告
+    report = crawler.generate_crawl_report()
+    print("\n爬取报告:")
+    print(json.dumps(report, indent=2, ensure_ascii=False))
 
 
 def main():
     """主函数"""
-    print("选择要运行的功能:")
-    print("1. 高并发爬虫演示")
-    print("2. 验证码破解演示")
-
-    choice = input("请输入选项(1/2): ").strip()
-
-    if choice == '1':
-        demo_high_concurrency_crawler()
-    elif choice == '2':
-        demo_geetest_captcha_cracker()
-    else:
-        print("无效选项，运行高并发爬虫演示")
-        demo_high_concurrency_crawler()
+    print("虚空爬虫 - 爬取整个网络世界的角落技术")
+    print("=" * 50)
+    
+    # 创建虚空爬虫实例
+    crawler = VoidCrawler(
+        max_workers=15,
+        request_delay=0.3,
+        use_proxies=True,
+        max_depth=4,
+        respect_robots_txt=True
+    )
+    
+    # 设置种子URL
+    seed_urls = [
+        'https://www.baidu.com',
+        'https://www.qq.com',
+        'https://www.sina.com.cn',
+        'https://www.163.com',
+        'https://www.sohu.com'
+    ]
+    
+    # 开始爬取
+    crawler.start_crawling(seed_urls, max_pages=500)
+    
+    # 打印最终统计信息
+    crawler._print_stats()
+    
+    # 生成爬取报告
+    report = crawler.generate_crawl_report()
+    print("\n爬取报告:")
+    print(json.dumps(report, indent=2, ensure_ascii=False))
 
 
 if __name__ == '__main__':
